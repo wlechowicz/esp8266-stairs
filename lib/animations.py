@@ -9,6 +9,11 @@ import time
 # - not sure if worth it, because right now (with dynamic step) wave in takes 3063ms for 3s, 5050ms for 5s and 22540ms for 20s duration, but they will never be this long
 # FIXME: 
 # - latest changes to wave in introduced a wave out bug, every other time it doesn't go to min level (all channels remain glowing)
+# - wave out animation is very choppy/flashy on low brigthness with step = 50, becomes smooth with step = 10 but timings is whack, maybe fixed with automatic step?
+# - - due to the above, auto step size as in wave in won't work if the duration is too short, because of constant cost of about 2ms of write and sleep per iteration step
+# - - sleep is a must to make animation non-blocking to the asyncio scheduler, but sleep cannot go lower than 1ms which is a bummer
+# - - AI says: maybe a better approach would be to calculate the time it takes to update all channels and sleep for the remaining time
+# - what would be the best was if the PCA9685 would allow a bulk update of all channels at once, but it doesn't, then we would have animation frames and it would be so much better
 
 class AnimationTarget:
     def __init__(self, set_channel_value, get_channel_value, num_channels):
