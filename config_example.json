@@ -1,0 +1,8 @@
+{
+    "broker": "ip address",
+    "client_id": "esp8266-some id (unique)",
+    "username": "hass-username",
+    "password": "hass-password",
+    "ssid": "wifi-ssid",
+    "ssid_password": "wifi-password"
+}
