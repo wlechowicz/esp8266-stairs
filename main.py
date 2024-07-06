@@ -1,32 +1,35 @@
-from machine import Pin, I2C
+from machine import Pin, I2C, PWM
 import asyncio
 import gc
 from ujson import loads
 from lib.pca9685 import PCA9685
-from lib.animations import Animations, AnimationTarget
+from lib.animations import Animations
 from lib.primitives.pushbutton import Pushbutton
 from lib.hass import Hass
 
 CONFIG = loads(open("config.json").read())
 
 # TODO:
-# - day and night mode based on RTC (probably can't do on ESP8266, already out of memory)
+# - day and night mode based on RTC
 
 print("Start")
 
 # HW config
-trigger1_pin = Pin(5, Pin.IN, Pin.PULL_UP)
-trigger2_pin = Pin(4, Pin.IN, Pin.PULL_UP)
-sda = Pin(12)
-scl = Pin(14)
+led_pin = Pin(2, Pin.OUT)
+trigger1_pin = Pin(14, Pin.IN, Pin.PULL_UP)
+trigger2_pin = Pin(27, Pin.IN, Pin.PULL_UP)
+sda = Pin(21)
+scl = Pin(22)
 
-i2c = I2C(sda=sda, scl=scl)
+i2c = I2C(0, scl=scl, sda=sda)
 
 pca = PCA9685(i2c, address=0x40)
 pca.freq(1000)
 
 # zero based channel indexes
-num_output_channels = 10
+num_output_channels = 17
+
+pwm0 = PWM(Pin(12), freq=2000, duty=0)
 
 # end HW config
 
@@ -34,7 +37,7 @@ last_channel = num_output_channels - 1
 
 
 # was in boot, but it takes too long and it's more important to set up HW asap
-def wifi_connect():
+async def wifi_connect():
     import network
 
     ssid = CONFIG["ssid"]
@@ -48,6 +51,7 @@ def wifi_connect():
         sta_if.active(True)
         sta_if.connect(ssid, psk)
         while not sta_if.isconnected():
+            await asyncio.sleep_ms(200)
             pass
     print("Network config:", sta_if.ifconfig())
 
@@ -57,7 +61,6 @@ animation = {
     "level_min": 0,
     "level_max": 4095,
     "edge_glow": 120,
-    "step": 50,
     "direction": "forward",
     "duration": 2,
     "pause_time": 15,
@@ -68,29 +71,39 @@ animation = {
     "animate_out": False,
 }
 
-state = {"on": True}
-
-
 # mirroring channel state in local memory because it's slow to read from PCA9685
-channels_state = [animation["level_min"]] * num_output_channels
+state = {
+    "on": True,
+    # animations iterate over this
+    "active_channels": [animation["level_min"]] * num_output_channels,
+    # target channel values (to accommodate edge glow)
+    "channels_low": [animation["level_min"]] * num_output_channels,
+}
+
+
+def update_state_idle_channels():
+    state["channels_low"] = [animation["level_min"]] * num_output_channels
+    if animation["edge_glow"] > animation["level_min"]:
+        state["channels_low"][0] = animation["edge_glow"]
+        state["channels_low"][-1] = animation["edge_glow"]
+
+
+update_state_idle_channels()
 
 
 def set_channel_value(index, value):
-    channels_state[index] = value
-    pca.duty(index, value)
+    state["active_channels"][index] = value
+    if index < 16:
+        pca.duty(index, value)
+    else:
+        pwm0.duty_u16(16 * value)
 
 
 def get_channel_value(index):
-    return channels_state[index]
+    return state["active_channels"][index]
 
 
-target = AnimationTarget(
-    set_channel_value,
-    get_channel_value,
-    num_output_channels,
-)
-
-animations = Animations(target, animation)
+animations = Animations(animation, state, set_channel_value, get_channel_value)
 
 all_animations = {
     "wave": [animations.wave_in, animations.wave_out, b"Wave"],
@@ -116,6 +129,8 @@ def set_idle_brightness_cb(idle_brightness=0):
     animation["level_min"] = min(max(idle_brightness, 0), animation["level_max"])
     if animation["state"] == "idle":
         set_idle_levels()
+    else:
+        update_state_idle_channels()
 
 
 hass.set_idle_brightness_cb(set_idle_brightness_cb)
@@ -125,6 +140,8 @@ def set_edge_glow_cb(edge_glow_level=0):
     animation["edge_glow"] = min(max(edge_glow_level, 0), animation["level_max"])
     if animation["state"] == "idle":
         set_idle_levels()
+    else:
+        update_state_idle_channels()
 
 
 hass.set_edge_glow_cb(set_edge_glow_cb)
@@ -148,16 +165,10 @@ def set_idle_levels():
             set_channel_value(i, 0)
         return
 
+    update_state_idle_channels()
+
     for i in range(num_output_channels):
-        if (
-            animation["edge_glow"] != animation["level_min"]
-            and i == 0
-            or i == last_channel
-        ):
-            level = max(animation["edge_glow"], animation["level_min"])
-            set_channel_value(i, level)
-        else:
-            set_channel_value(i, animation["level_min"])
+        set_channel_value(i, state["channels_low"][i])
 
 
 animation["pause_timer_ms"] = animation["pause_time"] * 1000
@@ -186,30 +197,42 @@ def handle_trigger1_fire():
     print("Trigger 1 fired")
     if state["on"]:
         start_animating(animation, "reversed")
+    return True
 
 
 def handle_trigger2_fire():
     print("Trigger 2 fired")
     if state["on"]:
         start_animating(animation, "forward")
+    return True
 
 
 async def blink_led(led_pin):
+    import network
+    sta_if = network.WLAN(network.STA_IF)
     while True:
-        led_pin.on()
+        led_pin.off()
+
+        if not sta_if.isconnected():
+            await asyncio.sleep_ms(100)
+            led_pin.on()
+            await asyncio.sleep_ms(100)
+            led_pin.off()
+            continue
+
 
         if not state["on"]:
             await asyncio.sleep_ms(600)
-            led_pin.off()
-            await asyncio.sleep_ms(100)
             led_pin.on()
-            await asyncio.sleep_ms(200)
+            await asyncio.sleep_ms(100)
             led_pin.off()
+            await asyncio.sleep_ms(200)
+            led_pin.on()
             await asyncio.sleep_ms(100)
             continue
 
         await asyncio.sleep_ms(1000)
-        led_pin.off()
+        led_pin.on()
         await asyncio.sleep_ms(1000)
 
 
@@ -265,9 +288,7 @@ async def check_mqtt_msg():
 
 
 async def my_app():
-
     # let me know you're alive LED
-    led_pin = Pin(2, Pin.OUT)
     asyncio.create_task(blink_led(led_pin))
 
     set_idle_levels()
@@ -283,13 +304,15 @@ async def my_app():
     trigger2 = Pushbutton(trigger2_pin)
     trigger2.press_func(handle_trigger2_fire)
 
-    wifi_connect()
+    await wifi_connect()
 
     gc.collect()
 
     # Home Asistant stuff
     hass.connect()
     asyncio.create_task(check_mqtt_msg())
+
+    # asyncio.create_task(animations.rain())
 
     # run forever
     while True:

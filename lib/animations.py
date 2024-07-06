@@ -2,30 +2,15 @@ import asyncio
 import time
 
 # TODO:
-# - animation step size can be calculated automatically based on duration and level range
-# - (done in wave in)
-# - could add an auto-correct that calculates how long iterations actually take and adjusts step size accordingly
-# - right now it's assumed that each iteration takes 1ms to update the channel plus 1ms sleep
-# - not sure if worth it, because right now (with dynamic step) wave in takes 3063ms for 3s, 5050ms for 5s and 22540ms for 20s duration, but they will never be this long
-# FIXME: 
-# - latest changes to wave in introduced a wave out bug, every other time it doesn't go to min level (all channels remain glowing)
-# - wave out animation is very choppy/flashy on low brigthness with step = 50, becomes smooth with step = 10 but timings is whack, maybe fixed with automatic step?
-# - - due to the above, auto step size as in wave in won't work if the duration is too short, because of constant cost of about 2ms of write and sleep per iteration step
-# - - sleep is a must to make animation non-blocking to the asyncio scheduler, but sleep cannot go lower than 1ms which is a bummer
-# - - AI says: maybe a better approach would be to calculate the time it takes to update all channels and sleep for the remaining time
 # - what would be the best was if the PCA9685 would allow a bulk update of all channels at once, but it doesn't, then we would have animation frames and it would be so much better
 
-class AnimationTarget:
-    def __init__(self, set_channel_value, get_channel_value, num_channels):
-        self.set_channel = set_channel_value
-        self.get_channel = get_channel_value
-        self.channels = num_channels
-        
 
 class Animations:
-    def __init__(self, AnimationTarget, animation):
-        self.target = AnimationTarget
+    def __init__(self, animation, state, set_channel_value, get_channel_value):
         self.animation = animation
+        self.set_channel = set_channel_value
+        self.get_channel = get_channel_value
+        self.main_state = state
 
     async def wave_in(self):
         print("animation wave in started")
@@ -34,115 +19,179 @@ class Animations:
 
         start_time = time.ticks_ms()
 
-        indexes = range(self.target.channels)
+        num_chan = len(self.main_state["channels_low"])
 
-        channels = indexes if a["direction"] == 'forward' else reversed(indexes)
+        indexes = range(num_chan)
 
-        channel_dur = a["duration"] * 300 // self.target.channels
+        channel_indexes = indexes if a["direction"] == "forward" else reversed(indexes)
+
+        channel_dur = a["duration"] * 120 // num_chan
 
         end_level = a["level_max"]
 
-        for i in channels:
+        for i in channel_indexes:
             # read current level from memory
-            initial_level = self.target.get_channel(i)
+            initial_level = self.get_channel(i)
             # start from current level, if above min level (error correction)
             start_level = max(initial_level, a["level_min"])
+            # skip if channel is already at target
+            if end_level == start_level:
+                continue
             step = (end_level - start_level) // channel_dur if channel_dur > 0 else 1
-            for level in range(start_level, end_level, step):
+            # pull to end_level
+            levels = list(range(start_level, end_level, step))
+            levels[-1] = end_level
+            for level in levels:
                 # break out if animation was terminated
-                if (a["state"] != "animate_in"):
+                if a["state"] != "animate_in":
                     print("animation wave in terminated")
                     return
                 # pull to max level so they aren't stuck not fully lit
-                level = level if level <= end_level - step else end_level
-                self.target.set_channel(i, level)
+                self.set_channel(i, level)
                 await asyncio.sleep_ms(1)
-        print("animation wave in took ", time.ticks_diff(time.ticks_ms(), start_time), "ms")
-        
+        print(
+            "animation wave in took ",
+            time.ticks_diff(time.ticks_ms(), start_time),
+            "ms",
+        )
+
     async def wave_out(self):
         print("animation wave out started")
 
         a = self.animation
 
-        num_steps = ((a["level_max"] - a["level_min"]) // a["step"]) * self.target.channels
-        step_delay_ms = max(a["duration"] * 1000 // num_steps, 1) if num_steps > 0 else 1
-
-        print("wave out step delay: ", step_delay_ms)
-
-        glow_enabled = a["edge_glow"] > a["level_min"]
-
-        last_channel = self.target.channels - 1
-
         start_time = time.ticks_ms()
 
-        indexes = range(self.target.channels)
+        idles = self.main_state["channels_low"]
 
-        loop_range = indexes if a["direction"] == 'forward' else reversed(indexes)
+        num_chan = len(idles)
 
-        for i in loop_range:
-            initial_level = self.target.get_channel(i)
-            # if glow enabled, don't go below glow level
-            final_level = a["edge_glow"] if glow_enabled and (i == 0 or i == last_channel) else a["level_min"]
-            for level in range(initial_level, final_level, -a["step"]):
+        indexes = range(num_chan)
+
+        channel_indexes = indexes if a["direction"] == "forward" else reversed(indexes)
+
+        channel_dur = a["duration"] * 120 // num_chan
+
+        for i in channel_indexes:
+            start_level = self.get_channel(i)
+            end_level = idles[i]
+            if end_level == start_level:
+                continue
+            step = (start_level - end_level) // channel_dur if channel_dur > 0 else 1
+
+            levels = list(range(start_level, end_level, -step))
+            # pull to min level so they aren't stuck not fully off
+            levels[-1] = end_level
+            for level in levels:
                 # break out if animation was terminated
-                if (a["state"] != "animate_out"):
+                if a["state"] != "animate_out":
                     print("animation wave out terminated")
                     return
-                # clamp to zero so they aren't stuck glowing
-                level = level if level >= a["step"] else 0
-                self.target.set_channel(i, level)
-                await asyncio.sleep_ms(step_delay_ms)
-        
-        print("animation wave out took ", time.ticks_diff(time.ticks_ms(), start_time), "ms")
+                self.set_channel(i, level)
+                await asyncio.sleep_ms(1)
+
+        print(
+            "animation wave out took ",
+            time.ticks_diff(time.ticks_ms(), start_time),
+            "ms",
+        )
 
     async def breathe_in(self):
         print("animation breathe in started")
 
         a = self.animation
 
-        num_steps = ((a["level_max"] - a["level_min"]) // a["step"])
-        step_delay_ms = max(a["duration"] * 1000 // num_steps, 1) if num_steps > 0 else 1
-
         start_time = time.ticks_ms()
 
-        for level in range(a["level_min"], a["level_max"], a["step"]):
-            level = level if level <= a["level_max"] - a["step"] else a["level_max"]
-            for i in range(self.target.channels):
+        num_chan = len(self.main_state["channels_low"])
+
+        delta_level = a["level_max"] - a["level_min"]
+
+        if delta_level == 0:
+            return
+
+        iter_time_ms = num_chan + 1
+
+        # animation duration = delta level * iteration time / level step
+        # so
+        # step = delta level * iteration time / animation duration
+
+        a_duration_ms = a["duration"] * 1000
+
+        step = delta_level * iter_time_ms // a_duration_ms
+
+        levels = list(range(a["level_min"], a["level_max"], step))
+        levels[-1] = a["level_max"]
+
+        for level in levels:
+            for i in range(num_chan):
                 # break out if animation was terminated
-                if (a["state"] != "animate_in"):
+                if a["state"] != "animate_in":
                     print("animation breathe in terminated")
                     return
                 # start higher if channel isn't initially at min level
-                new_level = max(level, self.target.get_channel(i))
-                self.target.set_channel(i, new_level)
-            await asyncio.sleep_ms(step_delay_ms)
-        print("animation breathe in took ", time.ticks_diff(time.ticks_ms(), start_time), "ms")
+                self.set_channel(i, max(level, self.get_channel(i)))
+            await asyncio.sleep_ms(1)
+        print(
+            "animation breathe in took ",
+            time.ticks_diff(time.ticks_ms(), start_time),
+            "ms",
+        )
 
     async def breathe_out(self):
         print("animation breathe out started")
 
         a = self.animation
-
-        num_steps = ((a["level_max"] - a["level_min"]) // a["step"])
-        step_delay_ms = max(a["duration"] * 1000 // num_steps, 1) if num_steps > 0 else 1
-
-        glow_enabled = a["edge_glow"] > a["level_min"]
-
-        last_channel = self.target.channels - 1
+        idles = self.main_state["channels_low"]
 
         start_time = time.ticks_ms()
 
-        for level in range(a["level_max"], a["level_min"], -a["step"]):
-            level = a["level_min"] if level < a["level_min"] + a["step"] else level
-            for i in range(self.target.channels):
+        num_chan = len(idles)
+
+        delta_level = a["level_max"] - a["level_min"]
+
+        if delta_level == 0:
+            return
+
+        iter_time_ms = num_chan + 1
+
+        a_duration_ms = a["duration"] * 1000
+
+        step = delta_level * iter_time_ms // a_duration_ms
+
+        levels = list(range(a["level_max"], a["level_min"], -step))
+        # pull to min level so they aren't stuck not fully off
+        levels[-1] = a["level_min"]
+
+        for level in levels:
+            for i in range(num_chan):
                 # break out if animation was terminated
-                if (a["state"] != "animate_out"):
+                if a["state"] != "animate_out":
                     print("animation breathe out terminated")
                     return
                 # start lower if channel isn't initially at max
-                new_level = min(level, self.target.get_channel(i))
-                # if glow enabled, don't go below glow on edges
-                new_level = max(level, a["edge_glow"]) if (i == 0 or i == last_channel) and glow_enabled else level
-                self.target.set_channel(i, new_level)
-            await asyncio.sleep_ms(step_delay_ms)
-        print("animation breathe out took ", time.ticks_diff(time.ticks_ms(), start_time), "ms")
+                # but don't go lower than idle value
+                self.set_channel(i, max(min(level, self.get_channel(i)), idles[i]))
+            await asyncio.sleep_ms(1)
+        print(
+            "animation breathe in took ",
+            time.ticks_diff(time.ticks_ms(), start_time),
+            "ms",
+        )
+
+    async def rain(self):
+        print("animation rain started")
+
+        # num_chan = len(self.main_state["channels_low"])
+
+        # sequence = noise_data
+        # dir = True
+        # num_rows = len(sequence)
+        # indexes = range(num_rows)
+        # while True:
+        #     for row in indexes:
+        #         for i in range(num_chan):
+        #             self.set_channel(i, sequence[row if dir else num_rows - row - 1][i])
+        #         await asyncio.sleep_ms(10)
+        #     dir = not dir
+        #     print("ding", dir)
